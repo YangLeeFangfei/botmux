@@ -128,6 +128,8 @@ vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/home/testuser/projects'),
   getProjectScanDir: vi.fn(() => '/home/testuser'),
   getProjectScanDirs: vi.fn(() => ['/home/testuser']),
+  getAvailableBots: vi.fn(() => []),
+  buildNewTopicPrompt: vi.fn((prompt: string) => `wrapped:${prompt}`),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
@@ -701,6 +703,23 @@ describe('handleCommand', () => {
       expect(newSessionUpdate![0].workingDir).toBe('/home/testuser/project-a');
     });
 
+    it('should remember the CLI input when pending repo is selected by command', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: 'continue the Gradio walkthrough',
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, 'wrapped:continue the Gradio walkthrough');
+      expect(ds.lastUserPrompt).toBe('continue the Gradio walkthrough');
+      expect(ds.lastCliInput).toBe('wrapped:continue the Gradio walkthrough');
+    });
+
     it('should show project list card when called without argument', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
       vi.mocked(scanMultipleProjects).mockReturnValue([
@@ -741,6 +760,20 @@ describe('handleCommand', () => {
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('当前没有待选择的仓库');
+    });
+
+    it('should remember the CLI input when pending repo is skipped', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: 'start in the default project',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/skip', ROOT_ID, makeLarkMessage('/skip'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, 'wrapped:start in the default project');
+      expect(ds.lastUserPrompt).toBe('start in the default project');
+      expect(ds.lastCliInput).toBe('wrapped:start in the default project');
     });
   });
 

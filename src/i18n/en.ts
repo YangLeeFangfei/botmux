@@ -23,6 +23,8 @@ export const messages: Record<string, string> = {
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.analyzing': 'Analyzing…',
+  'card.status.limited': 'Usage limit reached',
+  'card.status.retry_ready': 'Retry available',
   'card.status.executing': 'Executing…',
   'card.status.session_closed': '🛑 Session Closed',
   'card.status.selected': 'Selected',
@@ -36,6 +38,13 @@ export const messages: Record<string, string> = {
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
+  'card.usage_limit.retry_at': '⚠️ {cliName} usage limit reached. You can manually resend the last task after **{time}**.',
+  'card.usage_limit.retry_ready': '✅ The estimated recovery time has passed. You can manually resend the last task. If {cliName} still reports a usage limit, try again later.',
+  'card.usage_limit.retry_unknown': '⚠️ {cliName} usage limit reached. Please manually resend the last task later.',
+  'card.btn.retry_last_task': '🔁 Resend Last Task',
+  'card.action.retry_not_ready': 'Retry is not available yet. Please try again after {time}.',
+  'card.action.retry_no_task': 'There is no previous task to resend.',
+  'card.action.retry_sent': 'Resent the last task.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',

@@ -106,6 +106,14 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
   return false;
 }
 
+function clearUsageLimitState(ds: DaemonSession): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────
 
 export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -127,7 +135,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'retry_last_task'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -401,6 +409,57 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
 
+    if (actionType === 'retry_last_task' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const retryAtMs = ds.usageLimit?.retryAvailableAt ? Date.parse(ds.usageLimit.retryAvailableAt) : NaN;
+      if (Number.isFinite(retryAtMs) && retryAtMs > Date.now()) {
+        await sessionReply(rootId, t('card.action.retry_not_ready', { time: ds.usageLimit?.retryLabel ?? new Date(retryAtMs).toLocaleTimeString() }, locDs));
+        return;
+      }
+      if (!ds.lastCliInput) {
+        await sessionReply(rootId, t('card.action.retry_no_task', undefined, locDs));
+        return;
+      }
+
+      clearUsageLimitState(ds);
+      ds.lastScreenStatus = 'working';
+      if (ds.lastUserPrompt) ds.currentTurnTitle = ds.lastUserPrompt.substring(0, 50);
+
+      if (ds.worker && !ds.worker.killed) {
+        ds.worker.send({ type: 'message', content: ds.lastCliInput } as DaemonToWorker);
+        logger.info(`[${tag(ds)}] Retrying last task via card button`);
+      } else {
+        forkWorker(ds, ds.lastCliInput, ds.hasHistory);
+        logger.info(`[${tag(ds)}] Re-forking worker to retry last task via card button`);
+      }
+
+      if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
+        const botCfg = getBot(ds.larkAppId).config;
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          sessionAnchorId(ds),
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          'working',
+          botCfg.cliId,
+          ds.displayMode ?? 'hidden',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
+          locDs,
+        );
+        scheduleCardPatch(ds, cardJson);
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+      }
+
+      await sessionReply(rootId, t('card.action.retry_sent', undefined, locDs));
+      return;
+    }
+
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
     if ((actionType === 'toggle_display' || actionType === 'toggle_stream') && ds) {
@@ -483,6 +542,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          ds.usageLimit,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -521,6 +581,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          ds.usageLimit,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -584,6 +645,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          ds.usageLimit,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -634,10 +696,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const selfBot = getBot(ds.larkAppId);
         const botCfg = selfBot.config;
         const effectiveCliId = sessionCliId(ds);
+        const userPrompt = ds.pendingPrompt ?? '';
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const prompt = buildNewTopicPrompt(
-          ds.pendingPrompt ?? '',
+          userPrompt,
           ds.session.sessionId,
           effectiveCliId,
           botCfg.cliPathOverride,
@@ -649,6 +712,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           ds.pendingSender,
         );
+        ds.lastUserPrompt = userPrompt;
+        ds.lastCliInput = prompt;
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
@@ -735,9 +800,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const botCfg = selfBot.config;
     const effectiveCliId = sessionCliId(targetDs);
     // First-time repo selection — now spawn CLI with the original prompt
+    const userPrompt = targetDs.pendingPrompt ?? '';
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
-      targetDs.pendingPrompt ?? '',
+      userPrompt,
       targetDs.session.sessionId,
       effectiveCliId,
       botCfg.cliPathOverride,
@@ -749,6 +815,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       locTarget,
       targetDs.pendingSender,
     );
+    targetDs.lastUserPrompt = userPrompt;
+    targetDs.lastCliInput = prompt;
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;

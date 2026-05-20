@@ -289,6 +289,23 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
+    it('should show red template and "限额已达" for limited status', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'limited'));
+      expect(card.header.template).toBe('red');
+      expect(card.header.title.content).toContain('限额已达');
+    });
+
+    it('should show green template and "可重试" when usage-limit retry is ready', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'limited',
+        'codex', 'hidden', undefined, undefined, undefined, undefined, undefined,
+        { retryReady: true },
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('可重试');
+      expect(card.header.title.content).not.toContain('限额已达');
+    });
+
     it('should include escaped title in header', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
       expect(card.header.title.content).toContain('Fix \\*bug\\*');
@@ -414,6 +431,43 @@ describe('buildStreamingCard', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
       expect(actions).toHaveLength(4);
+    });
+
+    it('should describe limited retry time without showing retry button before it is ready', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'limited',
+        'codex', 'hidden', undefined, undefined, undefined, undefined, undefined,
+        { retryLabel: '12:11 PM', retryReady: false },
+      ));
+      expect(JSON.stringify(card)).toContain('12:11 PM');
+      expect(JSON.stringify(card)).toContain('Codex');
+      const actions = findActions(card);
+      expect(actions.find((a: any) => a.value?.action === 'retry_last_task')).toBeUndefined();
+    });
+
+    it('should use the current CLI name in limited status text', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'limited',
+        'gemini', 'hidden', undefined, undefined, undefined, undefined, undefined,
+        { retryLabel: '12:11 PM', retryReady: false },
+      ));
+      const body = JSON.stringify(card);
+      expect(body).toContain('Gemini');
+      expect(body).not.toContain('Codex 使用限额');
+    });
+
+    it('should show retry button when limited retry is ready', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'limited',
+        undefined, 'hidden', undefined, undefined, undefined, undefined, undefined,
+        { retryLabel: '12:11 PM', retryReady: true },
+      ));
+      const actions = findActions(card);
+      const retryBtn = actions.find((a: any) => a.value?.action === 'retry_last_task');
+      expect(retryBtn).toBeDefined();
+      expect(retryBtn.text.content).toContain('重发上一条任务');
+      expect(retryBtn.value.root_id).toBe(ROOT);
+      expect(retryBtn.value.session_id).toBe(SID);
     });
   });
 

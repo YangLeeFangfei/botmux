@@ -144,6 +144,15 @@ export interface ScheduledTask {
 /** Display modes for the streaming card output. */
 export type DisplayMode = 'hidden' | 'screenshot';
 
+export type WorkerScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited';
+export type StreamingCardStatus = 'starting' | WorkerScreenStatus;
+
+export interface UsageLimitState {
+  retryAvailableAt?: string;
+  retryLabel?: string;
+  retryReady?: boolean;
+}
+
 /** Quick-action keys sent from card buttons to the worker's PTY/tmux backend. */
 export type TermActionKey =
   | 'esc' | 'ctrlc' | 'tab' | 'enter' | 'space'
@@ -168,11 +177,11 @@ export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
-  | { type: 'screen_update'; content: string; status: 'working' | 'idle' | 'analyzing' }
+  | { type: 'screen_update'; content: string; status: WorkerScreenStatus; usageLimit?: UsageLimitState }
   | { type: 'error'; message: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
-  | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' }
+  | { type: 'screenshot_uploaded'; imageKey: string; status: WorkerScreenStatus; usageLimit?: UsageLimitState }
   | { type: 'user_notify'; message: string }
   | {
       type: 'final_output';

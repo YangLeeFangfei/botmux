@@ -26,6 +26,8 @@ export const messages: Record<string, string> = {
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.analyzing': '正在分析…',
+  'card.status.limited': '限额已达',
+  'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
   'card.status.session_closed': '🛑 会话已关闭',
   'card.status.selected': '已选择',
@@ -39,6 +41,13 @@ export const messages: Record<string, string> = {
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
+  'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。预计 **{time}** 后恢复，到时间后可以手动重发上一条任务。',
+  'card.usage_limit.retry_ready': '✅ 已到预计恢复时间，可以手动重发上一条任务。如果仍提示 {cliName} 使用限额，请稍后再试。',
+  'card.usage_limit.retry_unknown': '⚠️ 当前已达到 {cliName} 使用限额。请稍后再手动重发上一条任务。',
+  'card.btn.retry_last_task': '🔁 重发上一条任务',
+  'card.action.retry_not_ready': '还没有到可重试时间，请在 {time} 后再试。',
+  'card.action.retry_no_task': '没有可重发的上一条任务。',
+  'card.action.retry_sent': '已重发上一条任务。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',

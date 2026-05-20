@@ -32,7 +32,7 @@ import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from 
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
+import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey, UsageLimitState, WorkerScreenStatus } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
   DEFAULT_RENDER_COLS,
@@ -58,6 +58,7 @@ import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
+import { detectCliUsageLimitState, staleRetryReadyUsageLimitKey, usageLimitStateKey } from './utils/cli-usage-limit.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -90,6 +91,9 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: string[] = [];
+let usageLimitTurnSeq = 0;
+let usageLimitDetectedTurnSeq = 0;
+let lastUsageLimitStateJson = '';
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
 //
@@ -1714,6 +1718,7 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
+  let content = '';
   try {
     // Preferred path: pipe-pane backends ask tmux for a fresh viewport
     // snapshot and render it through a transient xterm-headless. This
@@ -1724,6 +1729,8 @@ async function captureAndUpload(): Promise<void> {
       if (pipeResult.ansi === lastShotHash) return;
       lastShotHash = pipeResult.ansi;
       png = pipeResult.png;
+      content = pipeResult.content;
+      lastAnalyzerSnapshot = pipeResult.content;
     } else {
       // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
       // still drive the long-lived renderer.
@@ -1734,6 +1741,7 @@ async function captureAndUpload(): Promise<void> {
       const hash = createHash('md5').update(snap).digest('hex');
       if (hash === lastShotHash) return;
       lastShotHash = hash;
+      content = renderer.snapshot().content;
       const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
       const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
       png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
@@ -1751,8 +1759,18 @@ async function captureAndUpload(): Promise<void> {
     return;
   }
 
-  let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+  let status: Exclude<WorkerScreenStatus, 'limited'> = isPromptReady ? 'idle' : 'working';
   if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
+  if (status === 'idle') {
+    const usageLimit = usageLimitStateFromContent(content || lastAnalyzerSnapshot || renderer?.snapshot().content || '');
+    const usageLimitStateJson = usageLimitStateKey(usageLimit);
+    if (usageLimit && (usageLimitDetectedTurnSeq !== usageLimitTurnSeq || usageLimitStateJson !== lastUsageLimitStateJson)) {
+      usageLimitDetectedTurnSeq = usageLimitTurnSeq;
+      lastUsageLimitStateJson = usageLimitStateJson;
+      send({ type: 'screenshot_uploaded', imageKey, status: 'limited', usageLimit });
+      return;
+    }
+  }
   send({ type: 'screenshot_uploaded', imageKey, status });
 }
 
@@ -2010,9 +2028,37 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, status: 'idle' });
+    sendScreenUpdate(content, 'idle');
   }
   flushPending();
+}
+
+function usageLimitStateFromContent(content: string): UsageLimitState | undefined {
+  return detectCliUsageLimitState(content);
+}
+
+function primeUsageLimitSuppressionForNewTurn(): void {
+  const staleKey = staleRetryReadyUsageLimitKey(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+  if (!staleKey) {
+    lastUsageLimitStateJson = '';
+    return;
+  }
+  usageLimitDetectedTurnSeq = usageLimitTurnSeq;
+  lastUsageLimitStateJson = staleKey;
+}
+
+function sendScreenUpdate(content: string, status: Exclude<WorkerScreenStatus, 'limited'>): void {
+  if (status === 'idle') {
+    const usageLimit = usageLimitStateFromContent(content);
+    const usageLimitStateJson = usageLimitStateKey(usageLimit);
+    if (usageLimit && (usageLimitDetectedTurnSeq !== usageLimitTurnSeq || usageLimitStateJson !== lastUsageLimitStateJson)) {
+      usageLimitDetectedTurnSeq = usageLimitTurnSeq;
+      lastUsageLimitStateJson = usageLimitStateJson;
+      send({ type: 'screen_update', content, status: 'limited', usageLimit });
+      return;
+    }
+  }
+  send({ type: 'screen_update', content, status });
 }
 
 function persistCliSessionId(cliSessionId: string): void {
@@ -2056,6 +2102,7 @@ function scheduleSubmitFailureNotify(
   failureReason?: string,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const turnSeq = usageLimitTurnSeq;
   const dropBridgeMark = (): void => {
     if (!bridgeTurnId) return;
     const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
@@ -2075,6 +2122,10 @@ function scheduleSubmitFailureNotify(
   }
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   setTimeout(async () => {
+    if (usageLimitDetectedTurnSeq === turnSeq) {
+      log(`Suppressing submit failure warning after usage-limit notice. preview="${preview}"`);
+      return;
+    }
     if (recheck) {
       try {
         if (await recheck()) {
@@ -2127,6 +2178,8 @@ async function flushPending(): Promise<void> {
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const msg = pendingMessages.shift()!;
+      usageLimitTurnSeq += 1;
+      primeUsageLimitSuppressionForNewTurn();
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
       // moment the message actually starts hitting the PTY — so any
@@ -2220,7 +2273,7 @@ function startScreenUpdates(): void {
   let lastTextSnapshotHash = '';
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
-    let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+    let status: Exclude<WorkerScreenStatus, 'limited'> = isPromptReady ? 'idle' : 'working';
     if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
@@ -2252,7 +2305,7 @@ function startScreenUpdates(): void {
 
       if (changed || status !== lastSentStatus) {
         lastSentStatus = status;
-        send({ type: 'screen_update', content, status });
+        sendScreenUpdate(content, status);
       }
     })();
   }, SCREEN_UPDATE_INTERVAL_MS);

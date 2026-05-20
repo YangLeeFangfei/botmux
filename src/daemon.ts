@@ -281,6 +281,19 @@ function getActiveCount(): number {
   return count;
 }
 
+function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliInput: string): void {
+  ds.lastUserPrompt = userPrompt;
+  ds.lastCliInput = cliInput;
+}
+
+function clearUsageLimitState(ds: DaemonSession): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+}
+
 /**
  * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
  * next screen_update from the worker POSTs a fresh streaming card instead of
@@ -290,6 +303,7 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
+  clearUsageLimitState(ds);
   if (ds.streamCardId && ds.workerPort) {
     const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
     const dsBotCfg = getBot(ds.larkAppId).config;
@@ -594,6 +608,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   if (pinnedWorkingDir) {
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
+    rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -619,6 +634,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
+    rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -940,6 +956,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
+      rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -965,6 +982,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
+      rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
     }
 
@@ -998,6 +1016,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
           sender: await getThreadSender(),
         });
+    rememberLastCliInput(ds, promptContent, msgContent);
     beginNewTurn(ds, parsed.content);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
@@ -1040,6 +1059,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender: await getThreadSender(),
     });
+    rememberLastCliInput(ds, promptContent, wrappedPrompt);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
 }

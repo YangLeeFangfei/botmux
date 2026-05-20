@@ -25,7 +25,7 @@ import { getBot, getAllBots } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
+import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode, UsageLimitState, StreamingCardStatus, WorkerScreenStatus } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -94,6 +94,78 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+function clearUsageLimitState(ds: DaemonSession): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+}
+
+export function updateUsageLimitState(ds: DaemonSession, usageLimit?: UsageLimitState): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  if (!usageLimit) {
+    ds.usageLimit = undefined;
+    return;
+  }
+
+  const retryMs = usageLimit.retryAvailableAt ? Date.parse(usageLimit.retryAvailableAt) : NaN;
+  ds.usageLimit = {
+    ...usageLimit,
+    retryReady: usageLimit.retryReady || (Number.isFinite(retryMs) && retryMs <= Date.now()),
+  };
+
+  if (!ds.usageLimit.retryAvailableAt || ds.usageLimit.retryReady) return;
+
+  const delayMs = Date.parse(ds.usageLimit.retryAvailableAt) - Date.now();
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    ds.usageLimit.retryReady = true;
+    return;
+  }
+
+  ds.usageLimitRetryTimer = setTimeout(() => {
+    ds.usageLimitRetryTimer = undefined;
+    if (ds.lastScreenStatus !== 'limited' || !ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) return;
+    ds.usageLimit = { ...(ds.usageLimit ?? {}), retryReady: true };
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+    const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+    const cardJson = buildStreamingCard(
+      ds.session.sessionId,
+      sessionAnchorId(ds),
+      readUrl,
+      turnTitle,
+      ds.lastScreenContent ?? '',
+      'limited',
+      effectiveCliId,
+      ds.displayMode ?? 'hidden',
+      ds.streamCardNonce,
+      ds.currentImageKey,
+      !!ds.adoptedFrom,
+      false,
+      localeForBot(ds.larkAppId),
+      ds.usageLimit,
+    );
+    scheduleCardPatch(ds, cardJson);
+  }, delayMs);
+  ds.usageLimitRetryTimer.unref?.();
+}
+
+export function resolveScreenStatus(
+  previousStatus: StreamingCardStatus | undefined,
+  usageLimit: UsageLimitState | undefined,
+  nextStatus: WorkerScreenStatus,
+): StreamingCardStatus {
+  if (previousStatus === 'limited' && usageLimit && nextStatus === 'idle') {
+    return 'limited';
+  }
+  return nextStatus;
 }
 
 const WORKER_ERROR_MARKER = '[botmux-worker-error]';
@@ -702,15 +774,22 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       case 'screen_update': {
         if (!ds.workerPort) break;
         const prevStatus = ds.lastScreenStatus;
+        const prevUsageLimitJson = JSON.stringify(ds.usageLimit ?? null);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = msg.status;
+        const effectiveStatus = resolveScreenStatus(prevStatus, ds.usageLimit, msg.status);
+        ds.lastScreenStatus = effectiveStatus;
+        if (msg.status === 'limited') {
+          updateUsageLimitState(ds, msg.usageLimit);
+        } else if (msg.status === 'working' || msg.status === 'analyzing') {
+          clearUsageLimitState(ds);
+        }
 
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
-        if (prevStatus !== msg.status) {
+        if (prevStatus !== effectiveStatus) {
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -744,7 +823,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
-            msg.status,
+            effectiveStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -752,6 +831,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
             loc,
+            ds.usageLimit,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -782,15 +862,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         } else {
           // Same turn — PATCH only on status change. Image PATCHes go through
           // the screenshot_uploaded path; text is no longer a card body mode.
-          const statusChanged = prevStatus !== msg.status;
-          if (!statusChanged) break;
+          const statusChanged = prevStatus !== effectiveStatus;
+          const usageLimitChanged = msg.status === 'limited' && prevUsageLimitJson !== JSON.stringify(ds.usageLimit ?? null);
+          if (!statusChanged && !usageLimitChanged) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
             readUrl,
             turnTitle,
             msg.content,
-            msg.status,
+            effectiveStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -798,6 +879,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
             loc,
+            ds.usageLimit,
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -808,8 +890,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
+        const effectiveStatus = resolveScreenStatus(ds.lastScreenStatus, ds.usageLimit, msg.status);
         ds.currentImageKey = msg.imageKey;
-        ds.lastScreenStatus = msg.status;
+        ds.lastScreenStatus = effectiveStatus;
+        if (msg.status === 'limited') {
+          updateUsageLimitState(ds, msg.usageLimit);
+        } else if (msg.status === 'working' || msg.status === 'analyzing') {
+          clearUsageLimitState(ds);
+        }
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
@@ -821,7 +909,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
-          msg.status,
+          effectiveStatus,
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
@@ -829,6 +917,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           isAdopt,
           showTakeover,
           loc,
+          ds.usageLimit,
         );
         scheduleCardPatch(ds, cardJson);
         break;

@@ -18,7 +18,7 @@
  *
  * Run:  pnpm vitest run test/card-integration.test.ts
  */
-import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import { FakeLarkClient } from './fixtures/fake-lark-client.js';
 import {
   makeToggleEvent,
@@ -152,7 +152,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { scheduleCardPatch } from '../src/core/worker-pool.js';
+import { resolveScreenStatus, scheduleCardPatch, updateUsageLimitState } from '../src/core/worker-pool.js';
 import { killWorker, forkWorker } from '../src/core/worker-pool.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -210,6 +210,15 @@ function makeDeps(activeSessions: Map<string, DaemonSession>): CardHandlerDeps {
   };
 }
 
+function makeRetryLastTaskEvent(rootId = ROOT_ID) {
+  return {
+    token: 'tok',
+    action: { tag: 'button', value: { action: 'retry_last_task', root_id: rootId, session_id: 'uuid-integ-test' } },
+    operator: { open_id: 'ou_user' },
+    host: 'im_message_card_action',
+  } as any;
+}
+
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
@@ -225,6 +234,41 @@ describe('Card integration: full event flow', () => {
     fakeLark.reset();
     sessionReplyResults = [];
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('keeps limited status when the same turn later reports idle', () => {
+    expect(resolveScreenStatus('limited', { retryLabel: '12:11 PM' }, 'idle')).toBe('limited');
+  });
+
+  it('patches the current card when usage-limit retry time is reached', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T00:00:00.000Z'));
+    const ds = makeDaemonSession({
+      streamCardId: 'om_stream_card',
+      workerPort: 8080,
+      lastScreenStatus: 'limited',
+      usageLimit: undefined,
+      lastScreenContent: 'usage limit terminal output',
+    });
+
+    updateUsageLimitState(ds, {
+      retryAvailableAt: new Date(Date.now() + 1000).toISOString(),
+      retryLabel: '12:01 AM',
+    });
+
+    expect(fakeLark.patches).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(ds.usageLimit?.retryReady).toBe(true);
+    expect(fakeLark.patches).toHaveLength(1);
+    expect(parseCard(fakeLark.patches[0].args[2]).status).toBe('limited');
+    const usageLimitArg = vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[13];
+    expect(usageLimitArg).toMatchObject({ retryReady: true, retryLabel: '12:01 AM' });
   });
 
   // ── Scenario 1: screen_update → POST card → toggle → PATCH ────────────
@@ -815,6 +859,29 @@ describe('Card integration: full event flow', () => {
       const result = await handleCardAction(event, deps, APP_ID);
       expect(result).toBeDefined();
       expect((result as any).adoptMode).toBe(true);
+    });
+
+    it('retry_last_task resends the last CLI input and clears limited state', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_stream_card',
+        lastScreenStatus: 'limited',
+        usageLimit: { retryReady: true, retryLabel: '12:11 PM' },
+        lastUserPrompt: 'plain user task',
+        lastCliInput: '<user_message>plain user task</user_message>',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const result = await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
+
+      expect((ds.worker as any).send).toHaveBeenCalledWith({
+        type: 'message',
+        content: '<user_message>plain user task</user_message>',
+      });
+      expect(ds.usageLimit).toBeUndefined();
+      expect(ds.lastScreenStatus).toBe('working');
+      expect((result as any).status).toBe('working');
     });
 
     it('restart on adopt session is hard-rejected (does not kill user CLI)', async () => {

@@ -388,10 +388,11 @@ export async function handleCommand(
           if (ds.pendingRepo) {
             const selfBot = getBot(ds.larkAppId);
             const botCfg = selfBot.config;
+            const userPrompt = ds.pendingPrompt ?? '';
             ds.pendingRepo = false;
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const prompt = buildNewTopicPrompt(
-              ds.pendingPrompt ?? '',
+              userPrompt,
               ds.session.sessionId,
               botCfg.cliId,
               botCfg.cliPathOverride,
@@ -403,6 +404,8 @@ export async function handleCommand(
               loc,
               ds.pendingSender,
             );
+            ds.lastUserPrompt = userPrompt;
+            ds.lastCliInput = prompt;
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
@@ -458,10 +461,11 @@ export async function handleCommand(
         if (ds?.pendingRepo) {
           const selfBot = getBot(ds.larkAppId);
           const botCfg = selfBot.config;
+          const userPrompt = ds.pendingPrompt ?? '';
           ds.pendingRepo = false;
           const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
           const prompt = buildNewTopicPrompt(
-            ds.pendingPrompt ?? '',
+            userPrompt,
             ds.session.sessionId,
             botCfg.cliId,
             botCfg.cliPathOverride,
@@ -473,6 +477,8 @@ export async function handleCommand(
             loc,
             ds.pendingSender,
           );
+          ds.lastUserPrompt = userPrompt;
+          ds.lastCliInput = prompt;
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;

@@ -73,7 +73,7 @@ export async function snapshotToPng(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
-): Promise<{ png: Buffer; ansi: string } | null> {
+): Promise<{ png: Buffer; ansi: string; content: string } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -83,8 +83,9 @@ export async function snapshotToPng(
     // the *current* visible rows, not buffer rows 0..N-1 which may be
     // stale scrollback after that scroll.
     const startY = terminal.buffer.active.baseY;
+    const content = readViewportText(terminal, { filter: false, startY, rows: snap.rows });
     const png = captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
-    return { png, ansi: snap.ansi };
+    return { png, ansi: snap.ansi, content };
   } finally {
     terminal.dispose();
   }
